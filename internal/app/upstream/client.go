@@ -3,6 +3,7 @@ package upstream
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/envoyproxy/xds-relay/internal/app/metrics"
@@ -19,6 +20,7 @@ import (
 	"github.com/envoyproxy/xds-relay/internal/pkg/util"
 	"github.com/uber-go/tally"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 )
 
 // UnsupportedResourceError is a custom error for unsupported typeURL
@@ -48,7 +50,7 @@ type Client interface {
 	// The shutdown function represents the intent that a stream is supposed to be closed.
 	// All goroutines that depend on the ctx object should consider ctx.Done to be related to shutdown.
 	// All such scenarios need to exit cleanly and are not considered an erroneous situation.
-	OpenStream(transport.Request) (<-chan transport.Response, func(), error)
+	OpenStream(transport.Request, string) (<-chan transport.Response, func())
 }
 
 type client struct {
@@ -64,12 +66,18 @@ type client struct {
 
 	logger log.Logger
 	scope  tally.Scope
+
+	shutdown <-chan struct{}
 }
 
 // CallOptions contains grpc client call options
 type CallOptions struct {
 	// Timeout is the time to wait on a blocking grpc SendMsg.
-	Timeout time.Duration
+	SendTimeout time.Duration
+
+	// Based on https://github.com/grpc/grpc-go/blob/v1.32.x/keepalive/keepalive.go#L27-L45
+	// If unset this defaults to 5 minutes
+	UpstreamKeepaliveTimeout string
 }
 
 type version struct {
@@ -93,12 +101,16 @@ func New(
 	namedLogger := logger.Named("upstream_client")
 	namedLogger.With("address", url).Info(ctx, "Initiating upstream connection")
 	subScope := scope.SubScope(metrics.ScopeUpstream)
-	// TODO: configure grpc options.https://github.com/envoyproxy/xds-relay/issues/55
-	conn, err := grpc.Dial(url, grpc.WithInsecure(),
+	conn, err := grpc.Dial(
+		url,
+		grpc.WithInsecure(),
+		grpc.WithKeepaliveParams(getKeepaliveParams(ctx, logger, callOptions)),
 		grpc.WithStreamInterceptor(ErrorClientStreamInterceptor(namedLogger, subScope)))
 	if err != nil {
 		return nil, err
 	}
+
+	go updateConnectivityMetric(ctx, conn, subScope)
 
 	ldsClient := v2.NewListenerDiscoveryServiceClient(conn)
 	rdsClient := v2.NewRouteDiscoveryServiceClient(conn)
@@ -110,7 +122,8 @@ func New(
 	edsClientV3 := endpointservice.NewEndpointDiscoveryServiceClient(conn)
 	cdsClientV3 := clusterservice.NewClusterDiscoveryServiceClient(conn)
 
-	go shutDown(ctx, conn)
+	shutdownSignal := make(chan struct{})
+	go shutDown(ctx, conn, shutdownSignal)
 
 	return &client{
 		ldsClient:   ldsClient,
@@ -124,80 +137,122 @@ func New(
 		callOptions: callOptions,
 		logger:      namedLogger,
 		scope:       subScope,
+		shutdown:    shutdownSignal,
 	}, nil
 }
 
-func (m *client) OpenStream(request transport.Request) (<-chan transport.Response, func(), error) {
+func (m *client) OpenStream(request transport.Request, aggregatedKey string) (<-chan transport.Response, func()) {
 	ctx, cancel := context.WithCancel(context.Background())
+	response := make(chan transport.Response)
+
+	go m.handleStreamsWithRetry(ctx, request, response, aggregatedKey)
+
+	// We use context cancellation over using a separate channel for signalling stream shutdown.
+	// The reason is cancelling a context tied with the stream is straightforward to signal closure.
+	// Also, the shutdown function could potentially be called more than once by a caller.
+	// Closing channels is not idempotent while cancelling context is idempotent.
+	return response, func() {
+		m.logger.With("aggregated_key", aggregatedKey).Debug(ctx, "cancelling stream")
+		cancel()
+	}
+}
+
+func (m *client) handleStreamsWithRetry(
+	ctx context.Context,
+	request transport.Request,
+	respCh chan transport.Response,
+	aggregatedKey string) {
 	var (
 		s      grpc.ClientStream
 		stream transport.Stream
 		err    error
 		scope  tally.Scope
 	)
-	switch request.GetTypeURL() {
-	case resource.ListenerType:
-		s, err = m.ldsClient.StreamListeners(ctx)
-		stream = transport.NewStreamV2(s, request, m.logger)
-		scope = m.scope.SubScope(metrics.ScopeUpstreamLDS)
-	case resource.ClusterType:
-		s, err = m.cdsClient.StreamClusters(ctx)
-		stream = transport.NewStreamV2(s, request, m.logger)
-		scope = m.scope.SubScope(metrics.ScopeUpstreamCDS)
-	case resource.RouteType:
-		s, err = m.rdsClient.StreamRoutes(ctx)
-		stream = transport.NewStreamV2(s, request, m.logger)
-		scope = m.scope.SubScope(metrics.ScopeUpstreamRDS)
-	case resource.EndpointType:
-		s, err = m.edsClient.StreamEndpoints(ctx)
-		stream = transport.NewStreamV2(s, request, m.logger)
-		scope = m.scope.SubScope(metrics.ScopeUpstreamEDS)
-	case resourcev3.ListenerType:
-		s, err = m.ldsClientV3.StreamListeners(ctx)
-		stream = transport.NewStreamV3(s, request, m.logger)
-		scope = m.scope.SubScope(metrics.ScopeUpstreamLDS)
-	case resourcev3.ClusterType:
-		s, err = m.cdsClientV3.StreamClusters(ctx)
-		stream = transport.NewStreamV3(s, request, m.logger)
-		scope = m.scope.SubScope(metrics.ScopeUpstreamCDS)
-	case resourcev3.RouteType:
-		s, err = m.rdsClientV3.StreamRoutes(ctx)
-		stream = transport.NewStreamV3(s, request, m.logger)
-		scope = m.scope.SubScope(metrics.ScopeUpstreamRDS)
-	case resourcev3.EndpointType:
-		s, err = m.edsClientV3.StreamEndpoints(ctx)
-		stream = transport.NewStreamV3(s, request, m.logger)
-		scope = m.scope.SubScope(metrics.ScopeUpstreamEDS)
-	default:
-		defer cancel()
-		m.logger.Error(ctx, "Unsupported Type Url %s", request.GetTypeURL())
-		return nil, nil, &UnsupportedResourceError{TypeURL: request.GetTypeURL()}
+	for {
+		childCtx, cancel := context.WithCancel(ctx)
+		select {
+		case _, ok := <-m.shutdown:
+			if !ok {
+				cancel()
+				close(respCh)
+				m.logger.With("aggregated_key", aggregatedKey).Info(ctx, "stream shutdown")
+				return
+			}
+		case <-ctx.Done():
+			// Context was cancelled, hence this is not an erroneous scenario.
+			// Context is cancelled only when shutdown is called or any of the send/recv goroutines error out.
+			// The shutdown can be called by the caller in many cases, during app shutdown/ttl expiry, etc
+			cancel()
+			close(respCh)
+			m.logger.With("aggregated_key", aggregatedKey).Info(ctx, "context cancelled")
+			return
+		default:
+			switch request.GetTypeURL() {
+			case resource.ListenerType:
+				s, err = m.ldsClient.StreamListeners(childCtx)
+				stream = transport.NewStreamV2(s, request, m.logger)
+				scope = m.scope.SubScope(metrics.ScopeUpstreamLDS)
+			case resource.ClusterType:
+				s, err = m.cdsClient.StreamClusters(childCtx)
+				stream = transport.NewStreamV2(s, request, m.logger)
+				scope = m.scope.SubScope(metrics.ScopeUpstreamCDS)
+			case resource.RouteType:
+				s, err = m.rdsClient.StreamRoutes(childCtx)
+				stream = transport.NewStreamV2(s, request, m.logger)
+				scope = m.scope.SubScope(metrics.ScopeUpstreamRDS)
+			case resource.EndpointType:
+				s, err = m.edsClient.StreamEndpoints(childCtx)
+				stream = transport.NewStreamV2(s, request, m.logger)
+				scope = m.scope.SubScope(metrics.ScopeUpstreamEDS)
+			case resourcev3.ListenerType:
+				s, err = m.ldsClientV3.StreamListeners(childCtx)
+				stream = transport.NewStreamV3(s, request, m.logger)
+				scope = m.scope.SubScope(metrics.ScopeUpstreamLDS)
+			case resourcev3.ClusterType:
+				s, err = m.cdsClientV3.StreamClusters(childCtx)
+				stream = transport.NewStreamV3(s, request, m.logger)
+				scope = m.scope.SubScope(metrics.ScopeUpstreamCDS)
+			case resourcev3.RouteType:
+				s, err = m.rdsClientV3.StreamRoutes(childCtx)
+				stream = transport.NewStreamV3(s, request, m.logger)
+				scope = m.scope.SubScope(metrics.ScopeUpstreamRDS)
+			case resourcev3.EndpointType:
+				s, err = m.edsClientV3.StreamEndpoints(childCtx)
+				stream = transport.NewStreamV3(s, request, m.logger)
+				scope = m.scope.SubScope(metrics.ScopeUpstreamEDS)
+			default:
+				handleError(ctx, m.logger, aggregatedKey, "Unsupported Type Url", func() {}, fmt.Errorf(request.GetTypeURL()))
+				cancel()
+				close(respCh)
+				return
+			}
+			scope = scope.Tagged(map[string]string{metrics.TagName: aggregatedKey})
+			if err != nil {
+				m.logger.With("request_type", request.GetTypeURL(), "aggregated_key", aggregatedKey).Warn(ctx, "stream failed")
+				scope.Counter(metrics.UpstreamStreamCreationFailure).Inc(1)
+				cancel()
+				continue
+			}
+
+			signal := make(chan *version, 1)
+			m.logger.With("request_type", request.GetTypeURL(), "aggregated_key", aggregatedKey).Info(ctx, "stream opened")
+			scope.Counter(metrics.UpstreamStreamOpened).Inc(1)
+			// The xds protocol https://www.envoyproxy.io/docs/envoy/latest/api-docs/xds_protocol#ack
+			// specifies that the first request be empty nonce and empty version.
+			// The origin server will respond with the latest version.
+			signal <- &version{nonce: "", version: ""}
+			var wg sync.WaitGroup
+			wg.Add(2)
+
+			go send(childCtx, wg.Done, m.logger, cancel, stream, signal, m.callOptions, aggregatedKey)
+			go recv(childCtx, wg.Done, cancel, m.logger, respCh, stream, signal, aggregatedKey)
+
+			wg.Wait()
+			scope.Counter(metrics.UpstreamStreamRetry).Inc(1)
+			m.logger.With("aggregated_key", aggregatedKey).Info(ctx, "retrying")
+			close(signal)
+		}
 	}
-
-	if err != nil {
-		defer cancel()
-		return nil, nil, err
-	}
-	scope.Counter(metrics.UpstreamStreamOpened).Inc(1)
-
-	signal := make(chan *version, 1)
-	// The xds protocol https://www.envoyproxy.io/docs/envoy/latest/api-docs/xds_protocol#ack
-	// specifies that the first request be empty nonce and empty version.
-	// The origin server will respond with the latest version.
-	signal <- &version{nonce: "", version: ""}
-
-	response := make(chan transport.Response)
-
-	go send(ctx, m.logger, cancel, stream, signal, m.callOptions)
-	go recv(ctx, cancel, m.logger, response, stream, signal)
-
-	m.logger.With("request_type", request.GetTypeURL()).Info(ctx, "stream opened")
-
-	// We use context cancellation over using a separate channel for signalling stream shutdown.
-	// The reason is cancelling a context tied with the stream is straightforward to signal closure.
-	// Also, the shutdown function could potentially be called more than once by a caller.
-	// Closing channels is not idempotent while cancelling context is idempotent.
-	return response, func() { cancel() }, nil
 }
 
 // It is safe to assume send goroutine will not leak as long as these conditions are true:
@@ -206,24 +261,29 @@ func (m *client) OpenStream(request transport.Request) (<-chan transport.Respons
 // - send also exits on context cancellations.
 func send(
 	ctx context.Context,
+	complete func(),
 	logger log.Logger,
 	cancelFunc context.CancelFunc,
 	stream transport.Stream,
 	signal chan *version,
-	callOptions CallOptions) {
+	callOptions CallOptions,
+	aggregatedKey string) {
+	defer complete()
 	for {
 		select {
 		case sig, ok := <-signal:
 			if !ok {
 				return
 			}
+			logger.With("aggregated_key", aggregatedKey,
+				"version", sig.version).Debug(ctx, "sending to upstream")
 			// Ref: https://github.com/grpc/grpc-go/issues/1229#issuecomment-302755717
 			// Call SendMsg in a timeout because it can block in some cases.
 			err := util.DoWithTimeout(ctx, func() error {
 				return stream.SendMsg(sig.version, sig.nonce)
-			}, callOptions.Timeout)
+			}, callOptions.SendTimeout)
 			if err != nil {
-				handleError(ctx, logger, "Error in SendMsg", cancelFunc, err)
+				handleError(ctx, logger, aggregatedKey, "Error in SendMsg", cancelFunc, err)
 				return
 			}
 		case <-ctx.Done():
@@ -237,30 +297,35 @@ func send(
 // The only ways to exit the goroutine is by cancelling the context or when an error occurs.
 func recv(
 	ctx context.Context,
+	complete func(),
 	cancelFunc context.CancelFunc,
 	logger log.Logger,
 	response chan transport.Response,
 	stream transport.Stream,
-	signal chan *version) {
+	signal chan *version,
+	aggregatedKey string) {
+	defer complete()
 	for {
 		resp, err := stream.RecvMsg()
 		if err != nil {
-			handleError(ctx, logger, "Error in RecvMsg", cancelFunc, err)
-			break
+			handleError(ctx, logger, aggregatedKey, "Error in RecvMsg", cancelFunc, err)
+			return
 		}
 
 		select {
 		case <-ctx.Done():
-			break
+			return
 		default:
 			response <- resp
+			logger.With("aggregated_key", aggregatedKey,
+				"version", resp.GetPayloadVersion()).Debug(ctx, "Received from upstream")
 			signal <- &version{version: resp.GetPayloadVersion(), nonce: resp.GetNonce()}
 		}
 	}
-	closeChannels(signal, response)
 }
 
-func handleError(ctx context.Context, logger log.Logger, errMsg string, cancelFunc context.CancelFunc, err error) {
+func handleError(ctx context.Context, logger log.Logger, key string, errMsg string,
+	cancelFunc context.CancelFunc, err error) {
 	defer cancelFunc()
 	select {
 	case <-ctx.Done():
@@ -268,24 +333,53 @@ func handleError(ctx context.Context, logger log.Logger, errMsg string, cancelFu
 		// Context is cancelled only when shutdown is called or any of the send/recv goroutines error out.
 		// The shutdown can be called by the caller in many cases, during app shutdown/ttl expiry, etc
 	default:
-		logger.Error(ctx, "%s: %s", errMsg, err.Error())
+		logger.With("aggregated_key", key).Error(ctx, "%s: %s", errMsg, err.Error())
 	}
-}
-
-// closeChannels is called whenever the context is cancelled (ctx.Done) in Send and Recv goroutines.
-// It is also called when an irrecoverable error occurs and the error is passed to the caller.
-func closeChannels(versionChan chan *version, responseChan chan transport.Response) {
-	close(versionChan)
-	close(responseChan)
 }
 
 // shutDown should be called in a separate goroutine.
 // This is a blocking function that closes the upstream connection on context completion.
-func shutDown(ctx context.Context, conn *grpc.ClientConn) {
+func shutDown(ctx context.Context, conn *grpc.ClientConn, signal chan struct{}) {
 	<-ctx.Done()
 	conn.Close()
+	close(signal)
 }
 
 func (e *UnsupportedResourceError) Error() string {
 	return fmt.Sprintf("Unsupported resource typeUrl: %s", e.TypeURL)
+}
+
+func updateConnectivityMetric(ctx context.Context, conn *grpc.ClientConn, scope tally.Scope) {
+	for {
+		isChanged := conn.WaitForStateChange(ctx, conn.GetState())
+		// Based on the grpc implementation, isChanged is false only when ctx expires
+		// https://github.com/grpc/grpc-go/blob/0f7e218c2cf49c7b0ca8247711b0daed2a07e79a/clientconn.go#L509-L510
+		// We set an unusually high value in case of ctx expires to show the connection is dead.
+		if !isChanged {
+			// The possible states are https://godoc.org/google.golang.org/grpc/connectivity
+			// ctx expired is not part of state enum and we've chosen 100 as a sufficiently high
+			// number to avoid collision. Using -1 is possible too, but we're not sure about using
+			// negative numbers in gauges.
+			scope.Gauge(metrics.UpstreamConnected).Update(100)
+			return
+		}
+
+		scope.Gauge(metrics.UpstreamConnected).Update(float64(conn.GetState()))
+	}
+}
+
+func getKeepaliveParams(ctx context.Context, logger log.Logger, c CallOptions) keepalive.ClientParameters {
+	keepaliveClientParams := keepalive.ClientParameters{
+		PermitWithoutStream: true,
+		Time:                5 * time.Minute,
+	}
+
+	t, e := time.ParseDuration(c.UpstreamKeepaliveTimeout)
+	if e != nil {
+		logger.Warn(ctx, "Keepalive time parsing failed")
+		return keepaliveClientParams
+	}
+
+	keepaliveClientParams.Time = t
+	return keepaliveClientParams
 }

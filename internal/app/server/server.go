@@ -15,6 +15,7 @@ import (
 	gcpv2 "github.com/envoyproxy/go-control-plane/pkg/server/v2"
 	gcpv3 "github.com/envoyproxy/go-control-plane/pkg/server/v3"
 	"github.com/envoyproxy/xds-relay/internal/app/metrics"
+	"google.golang.org/grpc/channelz/service"
 
 	clusterservice "github.com/envoyproxy/go-control-plane/envoy/service/cluster/v3"
 	endpointservice "github.com/envoyproxy/go-control-plane/envoy/service/endpoint/v3"
@@ -27,8 +28,6 @@ import (
 	"github.com/envoyproxy/xds-relay/internal/app/orchestrator"
 	"github.com/envoyproxy/xds-relay/internal/app/upstream"
 	"github.com/envoyproxy/xds-relay/internal/pkg/log"
-	"github.com/envoyproxy/xds-relay/internal/pkg/util"
-
 	aggregationv1 "github.com/envoyproxy/xds-relay/pkg/api/aggregation/v1"
 	bootstrapv1 "github.com/envoyproxy/xds-relay/pkg/api/bootstrap/v1"
 
@@ -91,12 +90,13 @@ func RunWithContext(ctx context.Context, cancel context.CancelFunc, bootstrapCon
 	// Initialize upstream client.
 	upstreamPort := strconv.FormatUint(uint64(bootstrapConfig.OriginServer.Address.PortValue), 10)
 	upstreamAddress := net.JoinHostPort(bootstrapConfig.OriginServer.Address.Address, upstreamPort)
-	// TODO: configure timeout param from bootstrap config.
-	// https://github.com/envoyproxy/xds-relay/issues/55
 	upstreamClient, err := upstream.New(
 		ctx,
 		upstreamAddress,
-		upstream.CallOptions{Timeout: time.Minute},
+		upstream.CallOptions{
+			SendTimeout:              time.Minute,
+			UpstreamKeepaliveTimeout: bootstrapConfig.OriginServer.KeepAliveTime,
+		},
 		logger,
 		scope,
 	)
@@ -134,7 +134,7 @@ func RunWithContext(ctx context.Context, cancel context.CancelFunc, bootstrapCon
 
 	go RunAdminServer(ctx, adminServer, logger)
 
-	registerShutdownHandler(ctx, cancel, server.GracefulStop, adminServer.Shutdown, logger, time.Second*30)
+	registerShutdownHandler(ctx, cancel, server.GracefulStop, adminServer.Shutdown, logger)
 	logger.With("address", listener.Addr()).Info(ctx, "Initializing server")
 	scope.SubScope(metrics.ScopeServer).Counter(metrics.ServerAlive).Inc(1)
 
@@ -148,27 +148,20 @@ func registerShutdownHandler(
 	cancel context.CancelFunc,
 	gracefulStop func(),
 	adminShutdown func(context.Context) error,
-	logger log.Logger,
-	waitTime time.Duration) {
+	logger log.Logger) {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		sig := <-sigs
 		logger.Info(ctx, "received interrupt signal:", sig.String())
-		err := util.DoWithTimeout(ctx, func() error {
-			logger.Info(ctx, "initiating admin server shutdown")
-			if shutdownErr := adminShutdown(ctx); shutdownErr != nil {
-				logger.With("error", shutdownErr).Error(ctx, "admin shutdown error: ", shutdownErr.Error())
-			}
-			logger.Info(ctx, "initiating grpc graceful stop")
-			gracefulStop()
-			_ = logger.Sync()
-			cancel()
-			return nil
-		}, waitTime)
-		if err != nil {
-			logger.Error(ctx, "shutdown error: ", err.Error())
+		logger.Info(ctx, "initiating admin server shutdown")
+		if shutdownErr := adminShutdown(ctx); shutdownErr != nil {
+			logger.With("error", shutdownErr).Error(ctx, "admin shutdown error: ", shutdownErr.Error())
 		}
+		logger.Info(ctx, "initiating grpc graceful stop")
+		cancel()
+		gracefulStop()
+		_ = logger.Sync()
 	}()
 }
 
@@ -184,4 +177,7 @@ func registerEndpoints(ctx context.Context, g *grpc.Server, o orchestrator.Orche
 	clusterservice.RegisterClusterDiscoveryServiceServer(g, gcpv3)
 	endpointservice.RegisterEndpointDiscoveryServiceServer(g, gcpv3)
 	listenerservice.RegisterListenerDiscoveryServiceServer(g, gcpv3)
+
+	// Use https://github.com/grpc/grpc-experiments/tree/master/gdebug to debug grpc channel issues
+	service.RegisterChannelzServiceToServer(g)
 }

@@ -21,10 +21,12 @@ const (
 	ScopeOrchestrator = "orchestrator"
 
 	// scope: .orchestrator.$aggregated_key.watch.*
-	ScopeOrchestratorWatch    = "watch"
-	OrchestratorWatchCreated  = "created"  // counter, # of watches created per aggregated key
-	OrchestratorWatchCanceled = "canceled" // counter, # of watch cancels initiated per aggregated key
-	OrchestratorWatchFanouts  = "fanout"   // counter, # of responses pushed downstream
+
+	ScopeOrchestratorWatch       = "watch"
+	OrchestratorWatchCreated     = "created"      // counter, # of watches created per aggregated key
+	OrchestratorNackWatchCreated = "created_nack" // counter, # of watches created per aggregated key in NACK requests
+	OrchestratorWatchCanceled    = "canceled"     // counter, # of watch cancels initiated per aggregated key
+	OrchestratorWatchFanouts     = "fanout"       // counter, # of responses pushed downstream
 
 	// scope: .orchestrator.$aggregated_key.cache_evict.*
 	ScopeOrchestratorCacheEvict            = "cache_evict"
@@ -57,6 +59,12 @@ const (
 	ScopeUpstreamEDS = "eds"
 
 	UpstreamStreamOpened = "stream_opened" // counter, # of times a gRPC stream was opened to the origin server.
+
+	UpstreamStreamRetry = "stream_retry" // counter, # of times a gRPC stream was opened to the origin server.
+
+	UpstreamStreamCreationFailure = "stream_failure" // counter, # of times a gRPC stream creation failed.
+
+	UpstreamConnected = "connected"
 )
 
 // .cache
