@@ -25,6 +25,7 @@ type Handler struct {
 
 func getHandlers(bootstrap *bootstrapv1.Bootstrap,
 	orchestrator *orchestrator.Orchestrator,
+	weboff chan bool,
 	logger log.Logger) []Handler {
 	handlers := []Handler{
 		{
@@ -34,14 +35,32 @@ func getHandlers(bootstrap *bootstrapv1.Bootstrap,
 			true,
 		},
 		{
+			"/ready",
+			"ready endpoint. usage: GET /ready POST /ready/true or ready/false",
+			readyHandler(weboff),
+			true,
+		},
+		{
+			"/cache/clear",
+			"clear cache entry for a given key. Omitting the key clears all cache entries. usage: `/cache/clear/<key>`",
+			clearCacheHandler(orchestrator),
+			true,
+		},
+		{
 			"/cache",
 			"print cache entry for a given key. Omitting the key outputs all cache entries. usage: `/cache/<key>`",
 			cacheDumpHandler(orchestrator),
 			true,
 		},
 		{
+			"/cache/version",
+			"print the version for a particular key. usage: `/cache/version/<key>`",
+			versionHandler(orchestrator),
+			true,
+		},
+		{
 			"/cache/eds",
-			"print the eds payload for a particular key. usage: `/eds/<key>`",
+			"print the eds payload for a particular key. usage: `/cache/eds/<key>`",
 			edsDumpHandler(orchestrator),
 			true,
 		},
@@ -96,8 +115,9 @@ func getHandlers(bootstrap *bootstrapv1.Bootstrap,
 
 func RegisterHandlers(bootstrapConfig *bootstrapv1.Bootstrap,
 	orchestrator *orchestrator.Orchestrator,
+	weboff chan bool,
 	logger log.Logger) {
-	for _, handler := range getHandlers(bootstrapConfig, orchestrator, logger) {
+	for _, handler := range getHandlers(bootstrapConfig, orchestrator, weboff, logger) {
 		http.Handle(handler.pattern, handler.handler)
 		if !strings.HasSuffix(handler.pattern, "/") && handler.redirect {
 			http.Handle(handler.pattern+"/", handler.handler)
@@ -163,7 +183,6 @@ func logLevelHandler(l log.Logger) http.HandlerFunc {
 			fmt.Fprintf(w, "Current log level: %s\n", l.GetLevel())
 		} else {
 			w.WriteHeader(http.StatusMethodNotAllowed)
-			fmt.Fprintf(w, "Only POST is supported\n")
 		}
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"time"
 
 	bootstrapv1 "github.com/envoyproxy/xds-relay/pkg/api/bootstrap/v1"
 	"github.com/golang/protobuf/ptypes"
@@ -55,6 +56,8 @@ type Orchestrator interface {
 	GetReadOnlyCache() cache.ReadOnlyCache
 
 	GetDownstreamAggregatedKeys() (map[string]bool, error)
+
+	ClearCacheEntries(keys []string) []error
 
 	CreateWatch(transport.Request) (transport.Watch, func())
 }
@@ -139,7 +142,6 @@ func (o *orchestrator) CreateWatch(req transport.Request) (transport.Watch, func
 			"request_type", req.GetTypeURL(),
 			"node_id", req.GetNodeID(),
 		).Error(ctx, "failed to map to aggregated key")
-		metrics.OrchestratorUnaggregatedWatchErrorsSubscope(o.scope).Counter(metrics.ErrorUnaggregatedKey).Inc(1)
 
 		// TODO (https://github.com/envoyproxy/xds-relay/issues/56)
 		// Support unnaggregated keys.
@@ -247,6 +249,17 @@ func (o *orchestrator) GetDownstreamAggregatedKeys() (map[string]bool, error) {
 	return keys, err
 }
 
+func (o *orchestrator) ClearCacheEntries(keys []string) []error {
+	var errors []error
+	for _, key := range keys {
+		err := o.cache.DeleteKey(key)
+		if err != nil {
+			errors = append(errors, err)
+		}
+	}
+	return errors
+}
+
 // watchUpstream is intended to be called in a go routine, to receive incoming
 // responses, cache the response, and fan out to downstream clients or
 // "watchers". There is a corresponding go routine for each aggregated key.
@@ -343,9 +356,10 @@ func (o *orchestrator) watchUpstream(
 
 // fanout pushes the response to the response channels of all open downstream
 // watchers in parallel.
-func (o *orchestrator) fanout(resp transport.Response, watchers map[transport.Request]bool, aggregatedKey string) {
+func (o *orchestrator) fanout(resp transport.Response, watchers *cache.RequestsStore, aggregatedKey string) {
+	start := time.Now()
 	var wg sync.WaitGroup
-	for watch := range watchers {
+	watchers.ForEach(func(key transport.Request) {
 		wg.Add(1)
 		go func(watch transport.Request) {
 			defer wg.Done()
@@ -369,10 +383,13 @@ func (o *orchestrator) fanout(resp transport.Response, watchers map[transport.Re
 				).Debug(context.Background(), "response sent")
 				metrics.OrchestratorWatchSubscope(o.scope, aggregatedKey).Counter(metrics.OrchestratorWatchFanouts).Inc(1)
 			}
-		}(watch)
-	}
+		}(key)
+	})
+
+	o.scope.Timer(metrics.TimerFanoutTime).Record(time.Since(start))
 	// Wait for all fanouts to complete.
 	wg.Wait()
+	o.scope.Timer(metrics.TimerSendTime).Record(time.Since(start))
 }
 
 // onCacheEvicted is called when the cache evicts a response due to TTL or
@@ -383,7 +400,7 @@ func (o *orchestrator) onCacheEvicted(key string, resource cache.Resource) {
 	// problem: https://github.com/envoyproxy/xds-relay/issues/71
 	metrics.OrchestratorCacheEvictSubscope(o.scope, key).Counter(metrics.OrcheestratorCacheEvictCount).Inc(1)
 	metrics.OrchestratorCacheEvictSubscope(o.scope, key).Counter(
-		metrics.OrchestratorOnCacheEvictedRequestCount).Inc(int64(len(resource.Requests)))
+		metrics.OrchestratorOnCacheEvictedRequestCount).Inc(int64(getLength(resource.Requests)))
 	o.logger.With("aggregated_key", key).Debug(context.Background(), "cache eviction called")
 	o.downstreamResponseMap.deleteAll(resource.Requests)
 	o.upstreamResponseMap.delete(key)
@@ -411,4 +428,10 @@ func (o *orchestrator) shutdown(ctx context.Context) {
 
 func isNackRequest(req transport.Request) bool {
 	return req.GetError() != nil
+}
+
+func getLength(m *cache.RequestsStore) int {
+	count := 0
+	m.ForEach(func(key transport.Request) { count++ })
+	return count
 }
