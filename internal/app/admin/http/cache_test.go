@@ -60,7 +60,6 @@ func TestAdminServer_VersionHandler(t *testing.T) {
 		Node: &envoy_config_core_v3.Node{
 			Id:      "test-1",
 			Cluster: "test-prod",
-			Metadata:
 		},
 		ResourceNames: []string{"res"},
 	}))
