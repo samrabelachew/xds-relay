@@ -3,6 +3,7 @@ package upstream
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -75,9 +76,19 @@ type CallOptions struct {
 	// Timeout is the time to wait on a blocking grpc SendMsg.
 	SendTimeout time.Duration
 
+	// StreamTimeout is the time to wait before closing and reopening the gRPC stream.
+	// If this is set to the Time.IsZero() value (ex: 0s), no stream timeout will be set unless
+	// gRPC is blocked on Send/Recv message. If blocked, the maximum of StreamBlockedTimeout or
+	// StreamTimeout is used.
+	StreamTimeout time.Duration
+	// StreamTimeoutJitter is an upper variance added to StreamTimeout to prevent a thundering
+	// herd of streams being reopened.
+	StreamTimeoutJitter time.Duration
+
+	// ConnKeepaliveTimeout is the gRPC connection keep-alive timeout.
 	// Based on https://github.com/grpc/grpc-go/blob/v1.32.x/keepalive/keepalive.go#L27-L45
-	// If unset this defaults to 5 minutes
-	UpstreamKeepaliveTimeout string
+	// If unset this defaults to 5 minutes.
+	ConnKeepaliveTimeout time.Duration
 }
 
 type version struct {
@@ -104,7 +115,10 @@ func New(
 	conn, err := grpc.Dial(
 		url,
 		grpc.WithInsecure(),
-		grpc.WithKeepaliveParams(getKeepaliveParams(ctx, logger, callOptions)),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			PermitWithoutStream: true,
+			Time:                callOptions.ConnKeepaliveTimeout,
+		}),
 		grpc.WithStreamInterceptor(ErrorClientStreamInterceptor(namedLogger, subScope)))
 	if err != nil {
 		return nil, err
@@ -167,24 +181,37 @@ func (m *client) handleStreamsWithRetry(
 		stream transport.Stream
 		err    error
 		scope  tally.Scope
+
+		// childCtx completion signifies that the the client has closed the stream.
+		childCtx context.Context
+		// cancel is called during shutdown or clean up operations from the caller. This will close the child context.
+		cancel context.CancelFunc
 	)
 	for {
-		childCtx, cancel := context.WithCancel(ctx)
+		if m.callOptions.StreamTimeout != 0*time.Second {
+			timeout := m.callOptions.getStreamTimeout()
+			m.logger.With("aggregated_key", aggregatedKey).Debug(ctx, "Connecting to upstream with timeout: %ds", timeout.Seconds())
+			childCtx, cancel = context.WithTimeout(ctx, timeout)
+		} else {
+			m.logger.With("aggregated_key", aggregatedKey).Debug(ctx, "Connecting to upstream with timeout")
+			childCtx, cancel = context.WithCancel(ctx)
+		}
 		select {
 		case _, ok := <-m.shutdown:
 			if !ok {
 				cancel()
 				close(respCh)
-				m.logger.With("aggregated_key", aggregatedKey).Info(ctx, "stream shutdown")
+				m.logger.With("aggregated_key", aggregatedKey).Debug(ctx, "stream shutdown")
 				return
 			}
 		case <-ctx.Done():
 			// Context was cancelled, hence this is not an erroneous scenario.
-			// Context is cancelled only when shutdown is called or any of the send/recv goroutines error out.
-			// The shutdown can be called by the caller in many cases, during app shutdown/ttl expiry, etc
+			// Context is cancelled only when shutdown is called or any of the send/recv goroutines
+			// error out or context timeout is reached. The shutdown can be called by the caller in
+			// many cases, during app shutdown/ttl expiry, etc.
 			cancel()
 			close(respCh)
-			m.logger.With("aggregated_key", aggregatedKey).Info(ctx, "context cancelled")
+			m.logger.With("aggregated_key", aggregatedKey, "err", ctx.Err()).Debug(ctx, "context cancelled")
 			return
 		default:
 			switch request.GetTypeURL() {
@@ -273,21 +300,28 @@ func send(
 		select {
 		case sig, ok := <-signal:
 			if !ok {
+				// This shouldn't happen since the signal channel is only closed during garbage
+				// collection, but in the case of an erroneous error, cancelling allows recv() to
+				// exit cleanly.
+				logger.With("aggregated_key", aggregatedKey).Debug(ctx, "send(): chan closed")
+				cancelFunc()
 				return
 			}
 			logger.With("aggregated_key", aggregatedKey,
-				"version", sig.version).Debug(ctx, "sending to upstream")
+				"version", sig.version).Debug(ctx, "send(): sending version and nonce to upstream (ACK)")
 			// Ref: https://github.com/grpc/grpc-go/issues/1229#issuecomment-302755717
 			// Call SendMsg in a timeout because it can block in some cases.
 			err := util.DoWithTimeout(ctx, func() error {
 				return stream.SendMsg(sig.version, sig.nonce)
 			}, callOptions.SendTimeout)
 			if err != nil {
-				handleError(ctx, logger, aggregatedKey, "Error in SendMsg", cancelFunc, err)
+				handleError(ctx, logger, aggregatedKey, "send(): error", cancelFunc, err)
 				return
 			}
+			logger.With("aggregated_key", aggregatedKey, "version", sig.version).Debug(ctx, "send(): complete")
 		case <-ctx.Done():
 			_ = stream.CloseSend()
+			logger.With("aggregated_key", aggregatedKey).Debug(ctx, "send(): context done")
 			return
 		}
 	}
@@ -295,6 +329,8 @@ func send(
 
 // recv is an infinite loop which blocks on RecvMsg.
 // The only ways to exit the goroutine is by cancelling the context or when an error occurs.
+// response channel is used by the caller (orchestrator) to propagate responses to downstream clients.
+// signal channel is read by send() in order to send an ACK to the upstream client.
 func recv(
 	ctx context.Context,
 	complete func(),
@@ -306,22 +342,44 @@ func recv(
 	aggregatedKey string) {
 	defer complete()
 	for {
+		logger.With("aggregated_key", aggregatedKey).Debug(ctx, "recv(): listening for message")
 		resp, err := stream.RecvMsg()
 		if err != nil {
-			handleError(ctx, logger, aggregatedKey, "Error in RecvMsg", cancelFunc, err)
+			handleError(ctx, logger, aggregatedKey, "recv(): error", cancelFunc, err)
 			return
 		}
 
 		select {
 		case <-ctx.Done():
+			logger.With("aggregated_key", aggregatedKey,
+				"version", resp.GetPayloadVersion()).Debug(ctx, "recv(): context done")
 			return
 		default:
-			response <- resp
 			logger.With("aggregated_key", aggregatedKey,
-				"version", resp.GetPayloadVersion()).Debug(ctx, "Received from upstream")
-			signal <- &version{version: resp.GetPayloadVersion(), nonce: resp.GetNonce()}
+				"version", resp.GetPayloadVersion()).Debug(ctx, "recv(): received response from upstream")
+			// recv() will be blocking if the response channel is blocked from the receiver
+			// (orchestrator). Timeout after 5 seconds. TODO make receive timeout configurable
+			select {
+			case response <- resp:
+				signal <- &version{version: resp.GetPayloadVersion(), nonce: resp.GetNonce()}
+			case <-time.After(5 * time.Second):
+				handleError(ctx, logger, aggregatedKey, "recv(): blocked on receiver", cancelFunc, err)
+			}
 		}
 	}
+}
+
+func (co CallOptions) getStreamTimeout() time.Duration {
+	// note: if the combined jitter and timeout duration is > 292.47 calendar years, expect
+	// unsupported behavior/overflows in the below logic due to int64 max range. :)
+	//
+	// nanoseconds is the Time library's lowest granularity.
+	timeout := co.StreamTimeout.Nanoseconds()
+	if co.StreamTimeoutJitter != 0*time.Nanosecond {
+		jitter := rand.Int63n(co.StreamTimeoutJitter.Nanoseconds())
+		timeout = timeout + jitter
+	}
+	return time.Duration(timeout) * time.Nanosecond
 }
 
 func handleError(ctx context.Context, logger log.Logger, key string, errMsg string,
@@ -332,6 +390,7 @@ func handleError(ctx context.Context, logger log.Logger, key string, errMsg stri
 		// Context was cancelled, hence this is not an erroneous scenario.
 		// Context is cancelled only when shutdown is called or any of the send/recv goroutines error out.
 		// The shutdown can be called by the caller in many cases, during app shutdown/ttl expiry, etc
+		logger.With("aggregated_key", key).Debug(ctx, "context cancelled")
 	default:
 		logger.With("aggregated_key", key).Error(ctx, "%s: %s", errMsg, err.Error())
 	}
@@ -366,20 +425,4 @@ func updateConnectivityMetric(ctx context.Context, conn *grpc.ClientConn, scope 
 
 		scope.Gauge(metrics.UpstreamConnected).Update(float64(conn.GetState()))
 	}
-}
-
-func getKeepaliveParams(ctx context.Context, logger log.Logger, c CallOptions) keepalive.ClientParameters {
-	keepaliveClientParams := keepalive.ClientParameters{
-		PermitWithoutStream: true,
-		Time:                5 * time.Minute,
-	}
-
-	t, e := time.ParseDuration(c.UpstreamKeepaliveTimeout)
-	if e != nil {
-		logger.Warn(ctx, "Keepalive time parsing failed")
-		return keepaliveClientParams
-	}
-
-	keepaliveClientParams.Time = t
-	return keepaliveClientParams
 }

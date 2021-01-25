@@ -40,7 +40,10 @@ func TestAdminServer_VersionHandler(t *testing.T) {
 	mockScope := tally.NewTestScope("mock_orchestrator", make(map[string]string))
 	client := upstream.NewMockV3(
 		ctx,
-		upstream.CallOptions{SendTimeout: time.Second},
+		upstream.CallOptions{
+			SendTimeout:   time.Second,
+			StreamTimeout: 0 * time.Second,
+		},
 		nil,
 		nil,
 		nil,
@@ -91,7 +94,10 @@ func TestAdminServer_VersionHandler404(t *testing.T) {
 	upstreamCdsResponseChannel := make(chan *v2.DiscoveryResponse)
 	client := upstream.NewMock(
 		ctx,
-		upstream.CallOptions{SendTimeout: time.Second},
+		upstream.CallOptions{
+			SendTimeout:   time.Second,
+			StreamTimeout: 0 * time.Second,
+		},
 		nil,
 		nil,
 		nil,
@@ -213,7 +219,10 @@ func TestAdminServer_EDSDumpHandler404(t *testing.T) {
 	upstreamEdsResponseChannel := make(chan *v2.DiscoveryResponse)
 	client := upstream.NewMock(
 		ctx,
-		upstream.CallOptions{SendTimeout: time.Second},
+		upstream.CallOptions{
+			SendTimeout:   time.Second,
+			StreamTimeout: 0 * time.Second,
+		},
 		nil,
 		nil,
 		nil,
@@ -235,7 +244,10 @@ func TestAdminServer_KeyDumpHandler(t *testing.T) {
 	upstreamCdsResponseChannel := make(chan *v2.DiscoveryResponse)
 	client := upstream.NewMock(
 		ctx,
-		upstream.CallOptions{SendTimeout: time.Second},
+		upstream.CallOptions{
+			SendTimeout:   time.Second,
+			StreamTimeout: 0 * time.Second,
+		},
 		nil,
 		upstreamLdsResponseChannel,
 		nil,
@@ -290,7 +302,10 @@ func TestAdminServer_CacheDumpHandler(t *testing.T) {
 	mockScope := tally.NewTestScope("mock_orchestrator", make(map[string]string))
 	client := upstream.NewMock(
 		ctx,
-		upstream.CallOptions{SendTimeout: time.Second},
+		upstream.CallOptions{
+			SendTimeout:   time.Second,
+			StreamTimeout: 0 * time.Second,
+		},
 		nil,
 		upstreamResponseChannel,
 		nil,
@@ -365,7 +380,10 @@ func TestAdminServer_CacheDumpHandler_NotFound(t *testing.T) {
 	mockScope := tally.NewTestScope("mock_orchestrator", make(map[string]string))
 	client := upstream.NewMock(
 		ctx,
-		upstream.CallOptions{SendTimeout: time.Second},
+		upstream.CallOptions{
+			SendTimeout:   time.Second,
+			StreamTimeout: 0 * time.Second,
+		},
 		nil,
 		nil,
 		nil,
@@ -388,7 +406,7 @@ func TestAdminServer_CacheDumpHandler_NotFound(t *testing.T) {
 	assert.Equal(t, "", rr.Body.String())
 }
 
-func testAdminServerCacheDumpHelper(t *testing.T, urls []string) {
+func testAdminServerCacheDumpHelper(t *testing.T, isVerbose bool, urls []string) {
 	for _, url := range urls {
 		t.Run(url, func(t *testing.T) {
 			ctx := context.Background()
@@ -398,7 +416,10 @@ func testAdminServerCacheDumpHelper(t *testing.T, urls []string) {
 			mockScope := tally.NewTestScope("mock_orchestrator", make(map[string]string))
 			client := upstream.NewMock(
 				ctx,
-				upstream.CallOptions{SendTimeout: time.Second},
+				upstream.CallOptions{
+					SendTimeout:   time.Second,
+					StreamTimeout: 0 * time.Second,
+				},
 				nil,
 				upstreamResponseChannelLDS,
 				nil,
@@ -477,7 +498,7 @@ func testAdminServerCacheDumpHelper(t *testing.T, urls []string) {
 			handler.ServeHTTP(rr, req)
 			assert.Equal(t, http.StatusOK, rr.Code)
 
-			verifyCacheOutput(t, rr, "testdata/entire_cachev2_cds.json", "testdata/entire_cachev2_lds.json")
+			verifyCacheOutput(t, rr, isVerbose, "testdata/entire_cachev2_cds.json", "testdata/entire_cachev2_lds.json")
 			cancelLDSWatch()
 			cancelCDSWatch()
 		})
@@ -485,11 +506,11 @@ func testAdminServerCacheDumpHelper(t *testing.T, urls []string) {
 }
 
 func TestAdminServer_CacheDumpHandler_EntireCache(t *testing.T) {
-	testAdminServerCacheDumpHelper(t, []string{cacheURL, cacheURL + "/", cacheURL + "/*"})
+	testAdminServerCacheDumpHelper(t, false, []string{cacheURL, cacheURL + "/", cacheURL + "/*"})
 }
 
 func TestAdminServer_CacheDumpHandler_WildcardSuffix(t *testing.T) {
-	testAdminServerCacheDumpHelper(t, []string{cacheURL + "/t*", cacheURL + "/tes*", cacheURL + "/test*"})
+	testAdminServerCacheDumpHelper(t, false, []string{cacheURL + "/t*", cacheURL + "/tes*", cacheURL + "/test*"})
 }
 
 func TestAdminServer_CacheDumpHandler_WildcardSuffix_NotFound(t *testing.T) {
@@ -504,7 +525,10 @@ func TestAdminServer_CacheDumpHandler_WildcardSuffix_NotFound(t *testing.T) {
 			mockScope := tally.NewTestScope("mock_orchestrator", make(map[string]string))
 			client := upstream.NewMock(
 				ctx,
-				upstream.CallOptions{SendTimeout: time.Second},
+				upstream.CallOptions{
+					SendTimeout:   time.Second,
+					StreamTimeout: 0 * time.Second,
+				},
 				nil,
 				upstreamResponseChannelLDS,
 				nil,
@@ -591,7 +615,7 @@ func TestAdminServer_CacheDumpHandler_WildcardSuffix_NotFound(t *testing.T) {
 }
 
 // V3 Cache Dump Handler tests
-func testAdminServerCacheDumpHandlerV3(t *testing.T, urls []string) {
+func testAdminServerCacheDumpHandlerV3(t *testing.T, isVerbose bool, urls []string) {
 	for _, url := range urls {
 		t.Run(url, func(t *testing.T) {
 			ctx := context.Background()
@@ -601,7 +625,10 @@ func testAdminServerCacheDumpHandlerV3(t *testing.T, urls []string) {
 			mockScope := tally.NewTestScope("mock_orchestrator", make(map[string]string))
 			client := upstream.NewMockV3(
 				ctx,
-				upstream.CallOptions{SendTimeout: time.Second},
+				upstream.CallOptions{
+					SendTimeout:   time.Second,
+					StreamTimeout: 0 * time.Second,
+				},
 				nil,
 				upstreamResponseChannelLDS,
 				nil,
@@ -679,7 +706,7 @@ func testAdminServerCacheDumpHandlerV3(t *testing.T, urls []string) {
 
 			handler.ServeHTTP(rr, req)
 			assert.Equal(t, http.StatusOK, rr.Code)
-			verifyCacheOutput(t, rr, "testdata/entire_cachev3_cds.json", "testdata/entire_cachev3_lds.json")
+			verifyCacheOutput(t, rr, isVerbose, "testdata/entire_cachev3_cds.json", "testdata/entire_cachev3_lds.json")
 
 			cancelLDSWatch()
 			cancelCDSWatch()
@@ -688,11 +715,19 @@ func testAdminServerCacheDumpHandlerV3(t *testing.T, urls []string) {
 }
 
 func TestAdminServer_CacheDumpHandler_EntireCacheV3(t *testing.T) {
-	testAdminServerCacheDumpHandlerV3(t, []string{cacheURL, cacheURL + "/", cacheURL + "/*"})
+	testAdminServerCacheDumpHandlerV3(t, false, []string{cacheURL, cacheURL + "/", cacheURL + "/*"})
 }
 
 func TestAdminServer_CacheDumpHandler_WildcardSuffixV3(t *testing.T) {
-	testAdminServerCacheDumpHandlerV3(t, []string{cacheURL + "/t*", cacheURL + "/tes*", cacheURL + "/test*"})
+	testAdminServerCacheDumpHandlerV3(t, false, []string{cacheURL + "/t*", cacheURL + "/tes*", cacheURL + "/test*"})
+}
+
+func TestAdminServer_CacheDumpHandler_VerboseCache(t *testing.T) {
+	testAdminServerCacheDumpHelper(t, true, []string{cacheURL + "/test*?verbose=true"})
+}
+
+func TestAdminServer_CacheDumpHandler_SuccinctCache(t *testing.T) {
+	testAdminServerCacheDumpHelper(t, false, []string{cacheURL + "/*?verbose=false"})
 }
 
 // Clear Cache Handler tests
@@ -703,7 +738,10 @@ func TestAdminServer_ClearCacheHandler(t *testing.T) {
 	mockScope := tally.NewTestScope("mock_orchestrator", make(map[string]string))
 	client := upstream.NewMock(
 		ctx,
-		upstream.CallOptions{SendTimeout: time.Second},
+		upstream.CallOptions{
+			SendTimeout:   time.Second,
+			StreamTimeout: 0 * time.Second,
+		},
 		nil,
 		upstreamResponseChannel,
 		nil,
@@ -773,7 +811,10 @@ func TestAdminServer_ClearCacheHandler_NotFound(t *testing.T) {
 	mockScope := tally.NewTestScope("mock_orchestrator", make(map[string]string))
 	client := upstream.NewMock(
 		ctx,
-		upstream.CallOptions{SendTimeout: time.Second},
+		upstream.CallOptions{
+			SendTimeout:   time.Second,
+			StreamTimeout: 0 * time.Second,
+		},
 		nil,
 		nil,
 		nil,
@@ -808,7 +849,10 @@ func testAdminServerClearCacheHelper(t *testing.T, urls []string, expectedCacheC
 			mockScope := tally.NewTestScope("mock_orchestrator", make(map[string]string))
 			client := upstream.NewMock(
 				ctx,
-				upstream.CallOptions{SendTimeout: time.Second},
+				upstream.CallOptions{
+					SendTimeout:   time.Second,
+					StreamTimeout: 0 * time.Second,
+				},
 				nil,
 				upstreamResponseChannelLDS,
 				nil,
@@ -926,7 +970,10 @@ func testAdminServerClearCacheHelperV3(t *testing.T, urls []string) {
 			mockScope := tally.NewTestScope("mock_orchestrator", make(map[string]string))
 			client := upstream.NewMockV3(
 				ctx,
-				upstream.CallOptions{SendTimeout: time.Second},
+				upstream.CallOptions{
+					SendTimeout:   time.Second,
+					StreamTimeout: 0 * time.Second,
+				},
 				nil,
 				upstreamResponseChannelLDS,
 				nil,
@@ -1028,7 +1075,7 @@ func TestAdminServer_ClearCacheHandler_WildcardSuffixV3(t *testing.T) {
 	testAdminServerClearCacheHelperV3(t, []string{clearURL + "/t*", clearURL + "/tes*", clearURL + "/test*"})
 }
 
-func verifyCacheOutput(t *testing.T, rr *httptest.ResponseRecorder, cdsFile string, ldsFile string) {
+func verifyCacheOutput(t *testing.T, rr *httptest.ResponseRecorder, isVerbose bool, cdsFile string, ldsFile string) {
 	var actualResponse map[string]interface{}
 	err := json.Unmarshal(rr.Body.Bytes(), &actualResponse)
 	assert.NoError(t, err)
@@ -1062,8 +1109,15 @@ func verifyCacheOutput(t *testing.T, rr *httptest.ResponseRecorder, cdsFile stri
 	assert.Equal(t, expectedCdsResponse["Key"], actualCdsResponse["Key"])
 	assert.Equal(t, expectedLdsResponse["Resp"], actualLdsResponse["Resp"])
 	assert.Equal(t, expectedCdsResponse["Resp"], actualCdsResponse["Resp"])
-	assert.Equal(t, len(actualLdsResponse["Requests"].([]interface{})), 1)
-	assert.Equal(t, len(actualCdsResponse["Requests"].([]interface{})), 1)
+	assert.Equal(t, actualLdsResponse["NumRequests"], float64(1))
+	assert.Equal(t, actualCdsResponse["NumRequests"], float64(1))
+	if isVerbose {
+		assert.Equal(t, len(actualLdsResponse["Requests"].([]interface{})), 1)
+		assert.Equal(t, len(actualCdsResponse["Requests"].([]interface{})), 1)
+	} else {
+		assert.NotContains(t, actualLdsResponse, "Requests")
+		assert.NotContains(t, actualCdsResponse, "Requests")
+	}
 	assert.NotNil(t, actualLdsResponse["ExpirationTime"])
 	assert.NotNil(t, actualCdsResponse["ExpirationTime"])
 }
