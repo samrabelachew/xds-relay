@@ -2,10 +2,10 @@ package transport
 
 import (
 	"context"
-
 	v3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"github.com/envoyproxy/xds-relay/internal/pkg/log"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 var _ Stream = &streamv3{}
@@ -25,15 +25,23 @@ func NewStreamV3(clientStream grpc.ClientStream, req Request, l log.Logger) Stre
 	}
 }
 
-func (s *streamv3) SendMsg(version string, nonce string) error {
+func (s *streamv3) SendMsg(version string, nonce string, metadata string) error {
 	msg := s.initialRequest.GetRaw().V3
 	msg.VersionInfo = version
 	msg.ErrorDetail = nil
 	msg.ResponseNonce = nonce
+	if s.initialRequest.GetNodeMetadata() != nil {
+		s.initialRequest.GetNodeMetadata().Fields["xdsrelay_node_metadata"] = &structpb.Value{
+			Kind: &structpb.Value_StringValue{
+				StringValue: metadata,
+			},
+		}
+	}
 	s.logger.With(
 		"request_type", msg.GetTypeUrl(),
 		"request_version", msg.GetVersionInfo(),
 		"request_resource_names", msg.ResourceNames,
+		"xdsrelay_node_metadata", metadata,
 	).Debug(context.Background(), "sent message")
 
 	return s.grpcClientStream.SendMsg(msg)
